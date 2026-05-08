@@ -32,7 +32,7 @@ namespace Saivs.Graphics.Core.MDI
 
             if (_supported && argsCount > 1)
             {
-                IntPtr dataPtr = WriteParams(bufferWithArgs, indexBuffer, argsStartIndex, argsCount, topology, indexFormat: 1, out int slot);
+                IntPtr dataPtr = WriteParams(bufferWithArgs, indexBuffer, argsStartIndex, argsCount, topology, indexFormat: 1, flags: 0, out int slot);
 
                 if (UsesPerInstanceVB)
                     cmd.DrawMesh(GetPrimeMesh(topology), Matrix4x4.identity, material, 0, shaderPass, properties);
@@ -74,7 +74,7 @@ namespace Saivs.Graphics.Core.MDI
 
             if (_supported && argsCount > 1)
             {
-                IntPtr dataPtr = WriteParams(bufferWithArgs, indexBuffer, argsStartIndex, argsCount, topology, indexFormat: 1, out int slot);
+                IntPtr dataPtr = WriteParams(bufferWithArgs, indexBuffer, argsStartIndex, argsCount, topology, indexFormat: 1, flags: 0, out int slot);
 
                 if (UsesPerInstanceVB)
                     cmd.DrawMesh(GetPrimeMesh(topology), Matrix4x4.identity, material, 0, shaderPass, properties);

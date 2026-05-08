@@ -4,14 +4,110 @@
 
 #include <vector>
 #include <cstring>
+#include <d3d11shader.h>
 #include "MDILog.h"
 #include "InlineHook.h"
 
 // -----------------------------------------------------------------------
-// PSO hook: inject per-instance TEXCOORD7 into graphics PSOs with TEXCOORD7
+// PSO hook: inject per-instance TEXCOORD7 into graphics PSOs.
+//   • If IL already declares TEXCOORD7 (indexed prime-mesh path) -> patch
+//     it to per-instance on slot 15.
+//   • If IL has no TEXCOORD7 but the user shader's VS declares it
+//     (mesh path: user shader uses MDI_INSTANCE_ID_PARAMETER over a
+//     user-supplied mesh) -> append a per-instance TEXCOORD7 element on
+//     slot 15. Bytecode is already passed into the PSO desc, so we just
+//     reflect it inline.
+//   • Otherwise pass through.
 // -----------------------------------------------------------------------
 
 static constexpr uint32_t kInstanceVBSlot = 15;
+
+// -----------------------------------------------------------------------
+// VS bytecode reflection (shared logic with D3D11 backend).
+// d3dcompiler_47.dll loaded dynamically — ships with every Win10+; if it's
+// somehow missing, mesh-path augmentation is skipped (existing indexed-path
+// patching keeps working since it doesn't rely on reflection).
+// -----------------------------------------------------------------------
+
+static const GUID kIID_ID3D11ShaderReflection_v47 =
+    { 0x8d536ca1, 0x0cca, 0x4956, { 0xa8, 0x37, 0x78, 0x69, 0x63, 0x75, 0x55, 0x84 } };
+
+using PFN_D3DReflect_t = HRESULT (WINAPI *)(LPCVOID, SIZE_T, REFIID, void**);
+
+static HMODULE         g_d3dCompilerModule    = nullptr;
+static PFN_D3DReflect_t g_D3DReflect          = nullptr;
+static bool            g_d3dCompilerAttempted = false;
+
+static void EnsureD3DCompilerLoaded()
+{
+    if (g_d3dCompilerAttempted) return;
+    g_d3dCompilerAttempted = true;
+
+    g_d3dCompilerModule = LoadLibraryA("d3dcompiler_47.dll");
+    if (!g_d3dCompilerModule)
+        g_d3dCompilerModule = LoadLibraryA("d3dcompiler_46.dll");
+
+    if (g_d3dCompilerModule)
+        g_D3DReflect = reinterpret_cast<PFN_D3DReflect_t>(
+            GetProcAddress(g_d3dCompilerModule, "D3DReflect"));
+
+    DebugLog("[MDI] D3D12 D3DReflect: %s\n",
+             g_D3DReflect ? "loaded" : "NOT loaded (mesh-path augmentation disabled)");
+}
+
+static bool VSInputHasTexcoord7(const void* bytecode, SIZE_T size)
+{
+    EnsureD3DCompilerLoaded();
+    if (!g_D3DReflect || !bytecode || size == 0)
+        return false;
+
+    // Quick DXBC magic check ('DXBC' as little-endian uint32 = 0x43425844).
+    // Guards against fake bytecode pointers from heuristic stream scans.
+    if (size < 4 || *reinterpret_cast<const uint32_t*>(bytecode) != 0x43425844u)
+        return false;
+
+    ID3D11ShaderReflection* refl = nullptr;
+    HRESULT hr = g_D3DReflect(bytecode, size, kIID_ID3D11ShaderReflection_v47,
+                              reinterpret_cast<void**>(&refl));
+    if (FAILED(hr) || !refl)
+        return false;
+
+    D3D11_SHADER_DESC desc = {};
+    refl->GetDesc(&desc);
+
+    bool found = false;
+    for (UINT i = 0; i < desc.InputParameters; ++i)
+    {
+        D3D11_SIGNATURE_PARAMETER_DESC p = {};
+        if (FAILED(refl->GetInputParameterDesc(i, &p))) continue;
+        if (p.SemanticName && strcmp(p.SemanticName, "TEXCOORD") == 0 && p.SemanticIndex == 7)
+        {
+            found = true;
+            break;
+        }
+    }
+
+    refl->Release();
+    return found;
+}
+
+// Build a deep-copy of the input layout that adds a per-instance TEXCOORD7
+// on slot 15 (used for the mesh-path "VS expects but IL lacks" case).
+static void BuildAugmentedLayout(const D3D12_INPUT_ELEMENT_DESC* src, UINT srcCount,
+                                  std::vector<D3D12_INPUT_ELEMENT_DESC>& out)
+{
+    out.assign(src, src + srcCount);
+
+    D3D12_INPUT_ELEMENT_DESC tex7 = {};
+    tex7.SemanticName         = "TEXCOORD";
+    tex7.SemanticIndex        = 7;
+    tex7.Format               = DXGI_FORMAT_R32_UINT;
+    tex7.InputSlot            = kInstanceVBSlot;
+    tex7.AlignedByteOffset    = 0;
+    tex7.InputSlotClass       = D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+    tex7.InstanceDataStepRate = 1;
+    out.push_back(tex7);
+}
 
 // Legacy API
 using PFN_CreateGraphicsPipelineState = HRESULT(STDMETHODCALLTYPE*)(
@@ -34,6 +130,7 @@ static bool g_deviceHooked = false;
 static uint32_t g_psoLegacyCallCount  = 0;
 static uint32_t g_psoStreamCallCount  = 0;
 static uint32_t g_psoInjectedCount    = 0;
+static uint32_t g_psoAddedCount       = 0;
 static uint32_t g_psoSkippedCount     = 0;
 static uint32_t g_pipelineLibCallCount = 0;
 static uint32_t g_loadGfxPipelineCallCount = 0;
@@ -124,37 +221,58 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateGraphicsPipelineState(
     if (!pDesc)
         return callOrig(self, pDesc, riid, ppPipelineState);
 
-    // Only modify PSOs that already have TEXCOORD7 (from our MDI Mesh).
-    // Skip PSOs without TEXCOORD7 (skybox, post-processing, etc.)
-    if (!HasTexcoord7(pDesc->InputLayout.pInputElementDescs, pDesc->InputLayout.NumElements))
+    const auto& il = pDesc->InputLayout;
+
+    // Case 1: IL already declares TEXCOORD7 (indexed prime-mesh path) — patch it.
+    if (HasTexcoord7(il.pInputElementDescs, il.NumElements))
     {
-        g_psoSkippedCount++;
-        return callOrig(self, pDesc, riid, ppPipelineState);
+        if (IsTexcoord7Correct(il.pInputElementDescs, il.NumElements))
+        {
+            g_psoSkippedCount++;
+            return callOrig(self, pDesc, riid, ppPipelineState);
+        }
+
+        std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+        BuildInjectedLayout(il.pInputElementDescs, il.NumElements, elements);
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC modifiedDesc = *pDesc;
+        modifiedDesc.InputLayout.pInputElementDescs = elements.data();
+        modifiedDesc.InputLayout.NumElements        = static_cast<UINT>(elements.size());
+
+        HRESULT hr = callOrig(self, &modifiedDesc, riid, ppPipelineState);
+
+        g_psoInjectedCount++;
+        if (g_psoInjectedCount <= 5)
+            DebugLog("[MDI] PSO legacy hook: patched TEXCOORD7 to per-instance (slot %u), "
+                     "elements=%u, hr=0x%08X\n",
+                     kInstanceVBSlot, (unsigned)elements.size(), hr);
+        return hr;
     }
 
-    if (IsTexcoord7Correct(pDesc->InputLayout.pInputElementDescs, pDesc->InputLayout.NumElements))
+    // Case 2: IL has no TEXCOORD7. If VS declares it (mesh path with user mesh
+    // + MDI_INSTANCE_ID_PARAMETER shader), append a per-instance element on slot 15.
+    if (VSInputHasTexcoord7(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength))
     {
-        g_psoSkippedCount++;
-        return callOrig(self, pDesc, riid, ppPipelineState);
+        std::vector<D3D12_INPUT_ELEMENT_DESC> augmented;
+        BuildAugmentedLayout(il.pInputElementDescs, il.NumElements, augmented);
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC modifiedDesc = *pDesc;
+        modifiedDesc.InputLayout.pInputElementDescs = augmented.data();
+        modifiedDesc.InputLayout.NumElements        = static_cast<UINT>(augmented.size());
+
+        HRESULT hr = callOrig(self, &modifiedDesc, riid, ppPipelineState);
+
+        g_psoAddedCount++;
+        if (g_psoAddedCount <= 5)
+            DebugLog("[MDI] PSO legacy hook: ADDED per-instance TEXCOORD7 on slot %u "
+                     "for user mesh (elements %u -> %u), hr=0x%08X\n",
+                     kInstanceVBSlot, il.NumElements, (UINT)augmented.size(), hr);
+        return hr;
     }
 
-    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
-    BuildInjectedLayout(pDesc->InputLayout.pInputElementDescs,
-                        pDesc->InputLayout.NumElements, elements);
-
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC modifiedDesc = *pDesc;
-    modifiedDesc.InputLayout.pInputElementDescs = elements.data();
-    modifiedDesc.InputLayout.NumElements        = static_cast<UINT>(elements.size());
-
-    HRESULT hr = callOrig(self, &modifiedDesc, riid, ppPipelineState);
-
-    g_psoInjectedCount++;
-    if (g_psoInjectedCount <= 5)
-        DebugLog("[MDI] PSO legacy hook: patched TEXCOORD7 to per-instance (slot %u), "
-                 "elements=%u, hr=0x%08X\n",
-                 kInstanceVBSlot, (unsigned)elements.size(), hr);
-
-    return hr;
+    // Case 3: VS doesn't declare TEXCOORD7 — pass through.
+    g_psoSkippedCount++;
+    return callOrig(self, pDesc, riid, ppPipelineState);
 }
 
 // -----------------------------------------------------------------------
@@ -178,48 +296,66 @@ static HRESULT STDMETHODCALLTYPE Hook_CreatePipelineState(
     if (!pDesc || !pDesc->pPipelineStateSubobjectStream || pDesc->SizeInBytes == 0)
         return callOrig(self, pDesc, riid, ppPipelineState);
 
-    // Scan stream for INPUT_LAYOUT subobject (type 12).
-    // Stream is a sequence of alignas(void*) subobjects.
-    // Each starts with D3D12_PIPELINE_STATE_SUBOBJECT_TYPE (uint32).
-    // For INPUT_LAYOUT, the D3D12_INPUT_LAYOUT_DESC follows at offset sizeof(void*)
-    // (because it contains a pointer → 8-byte aligned on x64).
+    // Scan stream for INPUT_LAYOUT and VS subobjects. Stream is a sequence of
+    // alignas(void*) subobjects. Each starts with D3D12_PIPELINE_STATE_SUBOBJECT_TYPE
+    // (uint32) followed by a type-specific data struct. For pointer-containing
+    // data (INPUT_LAYOUT, VS), the data starts at offset sizeof(void*).
+    //
+    // We walk by 8-byte steps and identify candidates by type-tag, validating
+    // each candidate against sane data ranges to reject false positives from
+    // step-aliased reads inside other subobjects' data.
     auto* stream = static_cast<const uint8_t*>(pDesc->pPipelineStateSubobjectStream);
     size_t streamSize = pDesc->SizeInBytes;
     constexpr size_t kAlign = sizeof(void*);  // 8 on x64
 
     size_t layoutOffset = SIZE_MAX;
+    const D3D12_INPUT_LAYOUT_DESC* origLayout = nullptr;
+    const D3D12_SHADER_BYTECODE*   origVS     = nullptr;
 
-    for (size_t off = 0; off + kAlign + sizeof(D3D12_INPUT_LAYOUT_DESC) <= streamSize; off += kAlign)
+    for (size_t off = 0; off + kAlign <= streamSize; off += kAlign)
     {
         auto type = *reinterpret_cast<const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*>(stream + off);
-        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT)
+
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT && !origLayout &&
+            off + kAlign + sizeof(D3D12_INPUT_LAYOUT_DESC) <= streamSize)
         {
             auto* layout = reinterpret_cast<const D3D12_INPUT_LAYOUT_DESC*>(stream + off + kAlign);
-            if (layout->NumElements < 64)
+            if (layout->NumElements < 64 && layout->pInputElementDescs)
             {
+                origLayout   = layout;
                 layoutOffset = off;
-                break;
+            }
+        }
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && !origVS &&
+                 off + kAlign + sizeof(D3D12_SHADER_BYTECODE) <= streamSize)
+        {
+            auto* vs = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + off + kAlign);
+            uintptr_t p = reinterpret_cast<uintptr_t>(vs->pShaderBytecode);
+            // Sanity-check: pointer in canonical user-space, size reasonable.
+            // Filters out false positives from step-aliased reads inside other
+            // subobjects' data (e.g. a uint32==1 field followed by garbage).
+            if (p > 0x10000ull && p < 0x7FFFFFFFFFFFull &&
+                vs->BytecodeLength >= 12 && vs->BytecodeLength < (16ull * 1024 * 1024))
+            {
+                origVS = vs;
             }
         }
     }
 
-    if (layoutOffset == SIZE_MAX)
+    if (!origLayout)
     {
-        // No INPUT_LAYOUT found — might be compute PSO or mesh shader
+        // No INPUT_LAYOUT — compute PSO or mesh-shader PSO.
         if (g_psoStreamCallCount <= 3)
             DebugLog("[MDI] PSO stream hook (#%u): no INPUT_LAYOUT found, streamSize=%zu\n",
                      g_psoStreamCallCount, streamSize);
         return callOrig(self, pDesc, riid, ppPipelineState);
     }
 
-    auto* origLayout = reinterpret_cast<const D3D12_INPUT_LAYOUT_DESC*>(
-        stream + layoutOffset + kAlign);
-
     if (g_psoStreamCallCount <= 5)
     {
-        DebugLog("[MDI] PSO stream hook (#%u): found INPUT_LAYOUT at offset %zu, "
-                 "NumElements=%u\n",
-                 g_psoStreamCallCount, layoutOffset, origLayout->NumElements);
+        DebugLog("[MDI] PSO stream hook (#%u): IL@%zu, elems=%u, VS=%s\n",
+                 g_psoStreamCallCount, layoutOffset, origLayout->NumElements,
+                 origVS ? "found" : "not found");
         for (UINT i = 0; i < origLayout->NumElements && i < 16; ++i)
         {
             const auto& e = origLayout->pInputElementDescs[i];
@@ -229,43 +365,60 @@ static HRESULT STDMETHODCALLTYPE Hook_CreatePipelineState(
         }
     }
 
-    // Only modify PSOs that already have TEXCOORD7 (from our MDI Mesh)
-    if (!HasTexcoord7(origLayout->pInputElementDescs, origLayout->NumElements))
+    // Helper to issue PSO with a modified INPUT_LAYOUT subobject in a copied stream.
+    auto issueWithLayout = [&](const std::vector<D3D12_INPUT_ELEMENT_DESC>& elements) -> HRESULT
     {
-        g_psoSkippedCount++;
-        return callOrig(self, pDesc, riid, ppPipelineState);
+        std::vector<uint8_t> modifiedStream(stream, stream + streamSize);
+        auto* patchedLayout = reinterpret_cast<D3D12_INPUT_LAYOUT_DESC*>(
+            modifiedStream.data() + layoutOffset + kAlign);
+        patchedLayout->pInputElementDescs = elements.data();
+        patchedLayout->NumElements        = static_cast<UINT>(elements.size());
+
+        D3D12_PIPELINE_STATE_STREAM_DESC modifiedDesc;
+        modifiedDesc.SizeInBytes                   = pDesc->SizeInBytes;
+        modifiedDesc.pPipelineStateSubobjectStream = modifiedStream.data();
+        return callOrig(self, &modifiedDesc, riid, ppPipelineState);
+    };
+
+    // Case 1: IL already declares TEXCOORD7 (indexed prime-mesh path) — patch it.
+    if (HasTexcoord7(origLayout->pInputElementDescs, origLayout->NumElements))
+    {
+        if (IsTexcoord7Correct(origLayout->pInputElementDescs, origLayout->NumElements))
+        {
+            g_psoSkippedCount++;
+            return callOrig(self, pDesc, riid, ppPipelineState);
+        }
+
+        std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+        BuildInjectedLayout(origLayout->pInputElementDescs, origLayout->NumElements, elements);
+
+        HRESULT hr = issueWithLayout(elements);
+        g_psoInjectedCount++;
+        if (g_psoInjectedCount <= 5)
+            DebugLog("[MDI] PSO stream hook: patched TEXCOORD7 to per-instance (slot %u), "
+                     "elements=%u, hr=0x%08X\n",
+                     kInstanceVBSlot, (unsigned)elements.size(), hr);
+        return hr;
     }
 
-    if (IsTexcoord7Correct(origLayout->pInputElementDescs, origLayout->NumElements))
+    // Case 2: IL has no TEXCOORD7. If VS declares it, append a per-instance element.
+    if (origVS && VSInputHasTexcoord7(origVS->pShaderBytecode, origVS->BytecodeLength))
     {
-        g_psoSkippedCount++;
-        return callOrig(self, pDesc, riid, ppPipelineState);
+        std::vector<D3D12_INPUT_ELEMENT_DESC> augmented;
+        BuildAugmentedLayout(origLayout->pInputElementDescs, origLayout->NumElements, augmented);
+
+        HRESULT hr = issueWithLayout(augmented);
+        g_psoAddedCount++;
+        if (g_psoAddedCount <= 5)
+            DebugLog("[MDI] PSO stream hook: ADDED per-instance TEXCOORD7 on slot %u "
+                     "for user mesh (elements %u -> %u), hr=0x%08X\n",
+                     kInstanceVBSlot, origLayout->NumElements, (UINT)augmented.size(), hr);
+        return hr;
     }
 
-    // Build patched layout
-    std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
-    BuildInjectedLayout(origLayout->pInputElementDescs, origLayout->NumElements, elements);
-
-    // Copy stream and patch the INPUT_LAYOUT in the copy
-    std::vector<uint8_t> modifiedStream(stream, stream + streamSize);
-    auto* patchedLayout = reinterpret_cast<D3D12_INPUT_LAYOUT_DESC*>(
-        modifiedStream.data() + layoutOffset + kAlign);
-    patchedLayout->pInputElementDescs = elements.data();
-    patchedLayout->NumElements        = static_cast<UINT>(elements.size());
-
-    D3D12_PIPELINE_STATE_STREAM_DESC modifiedDesc;
-    modifiedDesc.SizeInBytes                   = pDesc->SizeInBytes;
-    modifiedDesc.pPipelineStateSubobjectStream = modifiedStream.data();
-
-    HRESULT hr = callOrig(self, &modifiedDesc, riid, ppPipelineState);
-
-    g_psoInjectedCount++;
-    if (g_psoInjectedCount <= 5)
-        DebugLog("[MDI] PSO stream hook: patched TEXCOORD7 to per-instance (slot %u), "
-                 "elements=%u, hr=0x%08X\n",
-                 kInstanceVBSlot, (unsigned)elements.size(), hr);
-
-    return hr;
+    // Case 3: VS doesn't declare TEXCOORD7 — pass through.
+    g_psoSkippedCount++;
+    return callOrig(self, pDesc, riid, ppPipelineState);
 }
 
 // -----------------------------------------------------------------------
@@ -287,45 +440,56 @@ static HRESULT STDMETHODCALLTYPE Hook_LoadGraphicsPipeline(
     if (!pDesc)
         return callOrig(self, pName, pDesc, riid, ppPipelineState);
 
-    // Only modify PSOs that already have TEXCOORD7 (from our MDI Mesh)
-    if (!HasTexcoord7(pDesc->InputLayout.pInputElementDescs, pDesc->InputLayout.NumElements))
+    const auto& il = pDesc->InputLayout;
+
+    // Decide which augmentation, if any, applies to this PSO.
+    enum Mode { ModePassthrough, ModePatch, ModeAdd };
+    Mode mode = ModePassthrough;
+
+    if (HasTexcoord7(il.pInputElementDescs, il.NumElements))
+    {
+        if (IsTexcoord7Correct(il.pInputElementDescs, il.NumElements))
+        {
+            g_psoSkippedCount++;
+            return callOrig(self, pName, pDesc, riid, ppPipelineState);
+        }
+        mode = ModePatch;
+    }
+    else if (VSInputHasTexcoord7(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength))
+    {
+        mode = ModeAdd;
+    }
+    else
     {
         g_psoSkippedCount++;
         return callOrig(self, pName, pDesc, riid, ppPipelineState);
     }
 
-    if (IsTexcoord7Correct(pDesc->InputLayout.pInputElementDescs, pDesc->InputLayout.NumElements))
-    {
-        g_psoSkippedCount++;
-        return callOrig(self, pName, pDesc, riid, ppPipelineState);
-    }
-
-    // Patch TEXCOORD7 in the layout
     std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
-    BuildInjectedLayout(pDesc->InputLayout.pInputElementDescs,
-                        pDesc->InputLayout.NumElements, elements);
+    if (mode == ModePatch)
+        BuildInjectedLayout(il.pInputElementDescs, il.NumElements, elements);
+    else
+        BuildAugmentedLayout(il.pInputElementDescs, il.NumElements, elements);
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC modifiedDesc = *pDesc;
     modifiedDesc.InputLayout.pInputElementDescs = elements.data();
     modifiedDesc.InputLayout.NumElements        = static_cast<UINT>(elements.size());
 
     // Try loading with modified desc — will likely miss cache (different layout).
-    // On cache miss, falls through to CreateGraphicsPipelineState which our hook also catches.
+    // On cache miss, Unity falls back to CreateGraphicsPipelineState which our other hook catches.
     HRESULT hr = callOrig(self, pName, &modifiedDesc, riid, ppPipelineState);
 
     if (FAILED(hr))
     {
-        // Cache miss — fallback: the caller (Unity) will call CreateGraphicsPipelineState,
-        // where our other hook injects TEXCOORD7.
         if (g_loadGfxPipelineCallCount <= 5)
             DebugLog("[MDI] LoadGraphicsPipeline cache miss (modified desc), hr=0x%08X\n", hr);
         return callOrig(self, pName, pDesc, riid, ppPipelineState);
     }
 
-    g_psoInjectedCount++;
-    if (g_psoInjectedCount <= 5)
-        DebugLog("[MDI] LoadGraphicsPipeline: injected TEXCOORD7, elements=%u, hr=0x%08X\n",
-                 (unsigned)elements.size(), hr);
+    if (mode == ModePatch) g_psoInjectedCount++; else g_psoAddedCount++;
+    if ((g_psoInjectedCount + g_psoAddedCount) <= 5)
+        DebugLog("[MDI] LoadGraphicsPipeline: %s TEXCOORD7, elements=%u, hr=0x%08X\n",
+                 mode == ModePatch ? "patched" : "added", (unsigned)elements.size(), hr);
     return hr;
 }
 
@@ -556,6 +720,14 @@ void MDIBackend_D3D12::Shutdown()
     _d3d12       = nullptr;
     _initialized = false;
 
+    if (g_d3dCompilerModule)
+    {
+        FreeLibrary(g_d3dCompilerModule);
+        g_d3dCompilerModule = nullptr;
+    }
+    g_D3DReflect = nullptr;
+    g_d3dCompilerAttempted = false;
+
     DebugLog("[MDI] D3D12 backend shutdown\n");
 }
 
@@ -634,10 +806,10 @@ void MDIBackend_D3D12::ExecuteMDI(const MDIParams& params)
         DebugLog("[MDI] ExecuteMDI #%u: drawCount=%u, offset=%u\n",
                  s_callCount, params.maxDrawCount, params.argsOffsetBytes);
         DebugLog("[MDI] Hook stats: legacy=%u, stream=%u, pipelineLib=%u, "
-                 "loadGfx=%u, injected=%u, skipped=%u\n",
+                 "loadGfx=%u, patched=%u, added=%u, skipped=%u\n",
                  g_psoLegacyCallCount, g_psoStreamCallCount,
                  g_pipelineLibCallCount, g_loadGfxPipelineCallCount,
-                 g_psoInjectedCount, g_psoSkippedCount);
+                 g_psoInjectedCount, g_psoAddedCount, g_psoSkippedCount);
     }
 }
 

@@ -36,6 +36,7 @@ namespace Saivs.Graphics.Core.MDI
                     bufferWithArgs, meshIndexBuffer, argsStartIndex, argsCount,
                     mesh.GetTopology(0),
                     EncodeIndexFormat(mesh.indexFormat),
+                    flags: MDI_FLAG_MESH_PATH,
                     out int slot);
 
                 cmd.DrawMeshInstancedIndirect(mesh, 0, material, shaderPass,
@@ -76,6 +77,7 @@ namespace Saivs.Graphics.Core.MDI
                     bufferWithArgs, meshIndexBuffer, argsStartIndex, argsCount,
                     mesh.GetTopology(0),
                     EncodeIndexFormat(mesh.indexFormat),
+                    flags: MDI_FLAG_MESH_PATH,
                     out int slot);
 
                 cmd.DrawMeshInstancedIndirect(mesh, 0, material, shaderPass,

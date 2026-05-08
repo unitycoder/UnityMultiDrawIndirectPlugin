@@ -7,12 +7,18 @@ namespace Saivs.Graphics.Core.MDI
 {
     // CommandBuffer.MultiDrawMeshIndirect — vertex data comes from the user's
     // Mesh through the input assembler, so the shader can use the standard
-    // POSITION / NORMAL / TEXCOORD0 semantics. True MDI is currently routed
-    // to the native plugin only on backends whose MDI.hlsl branch resolves
-    // the global instance ID through SV_InstanceID — Metal, Vulkan and WebGPU.
-    // On D3D11/D3D12/OpenGL the call falls back to a per-draw
-    // DrawMeshInstancedIndirect loop (the user shader would otherwise need a
-    // TEXCOORD7 stream which user meshes don't carry) and emits a one-time warning.
+    // POSITION / NORMAL / TEXCOORD0 semantics. True MDI is routed to the
+    // native plugin on every supported backend:
+    //   • Metal / Vulkan / WebGPU — MDI.hlsl resolves the global instance ID
+    //     through SV_InstanceID, so the user mesh doesn't need TEXCOORD7.
+    //   • D3D11 / D3D12 — the native CreateInputLayout / CreateGraphicsPipelineState
+    //     hooks reflect the VS bytecode and append a per-instance TEXCOORD7
+    //     element on slot 15 when the user shader declares MDI_INSTANCE_ID_PARAMETER,
+    //     so the user mesh also doesn't need to carry TEXCOORD7.
+    //   • OpenGL ES / OpenGL Core — the native plugin uses Unity's mesh VAO
+    //     directly and adds a per-instance TEXCOORD7 attribute pointing at
+    //     the identity buffer. The mesh's existing per-vertex bindings stay
+    //     intact.
     public static partial class MultiDrawIndirect
     {
         // -----------------------------------------------------------------------
@@ -35,7 +41,11 @@ namespace Saivs.Graphics.Core.MDI
                 var api = SystemInfo.graphicsDeviceType;
                 return api == GraphicsDeviceType.Metal
                     || api == GraphicsDeviceType.Vulkan
-                    || api == GraphicsDeviceType.WebGPU;
+                    || api == GraphicsDeviceType.WebGPU
+                    || api == GraphicsDeviceType.Direct3D11
+                    || api == GraphicsDeviceType.Direct3D12
+                    || api == GraphicsDeviceType.OpenGLES3
+                    || api == GraphicsDeviceType.OpenGLCore;
             }
         }
 
@@ -66,11 +76,12 @@ namespace Saivs.Graphics.Core.MDI
             if (_meshFallbackWarned) return;
             _meshFallbackWarned = true;
             Debug.LogWarning(
-                $"[MDI] MultiDrawMeshIndirect: true MDI is currently supported only on " +
-                $"Metal, Vulkan and WebGPU. Current backend ({SystemInfo.graphicsDeviceType}) " +
-                $"falls back to a per-draw DrawMeshInstancedIndirect loop, and the user shader " +
-                $"must not require TEXCOORD7 in its vertex input layout (i.e. should not include " +
-                $"the default MDI_INSTANCE_ID_PARAMETER macro from MDI.hlsl on these APIs).");
+                $"[MDI] MultiDrawMeshIndirect: true MDI is currently supported on " +
+                $"Metal, Vulkan, WebGPU, Direct3D11, Direct3D12, OpenGL ES and OpenGL Core. " +
+                $"Current backend ({SystemInfo.graphicsDeviceType}) falls back to a per-draw " +
+                $"DrawMeshInstancedIndirect loop, and the user shader must not require TEXCOORD7 " +
+                $"in its vertex input layout (i.e. should not include the default " +
+                $"MDI_INSTANCE_ID_PARAMETER macro from MDI.hlsl on these APIs).");
         }
 
         // -----------------------------------------------------------------------
@@ -95,6 +106,7 @@ namespace Saivs.Graphics.Core.MDI
                     bufferWithArgs, meshIndexBuffer, argsStartIndex, argsCount,
                     mesh.GetTopology(0),
                     EncodeIndexFormat(mesh.indexFormat),
+                    flags: MDI_FLAG_MESH_PATH,
                     out int slot);
 
                 cmd.DrawMeshInstancedIndirect(mesh, 0, material, shaderPass,

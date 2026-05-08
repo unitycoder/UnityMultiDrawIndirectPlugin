@@ -111,10 +111,19 @@ bool MDIBackend_GLES::ResolveGLFunctions()
     _glBindVertexArray = (PFNGLBINDVERTEXARRAYPROC)GLGetProcAddress("glBindVertexArray");
     _glIsVertexArray = (PFNGLISVERTEXARRAYPROC)GLGetProcAddress("glIsVertexArray");
 
+    // Vertex attribute query / disable / non-integer pointer — needed for
+    // mesh-path VAO cloning so we leave Unity's VAO untouched.
+    _glVertexAttribPointer = (PFNGLVERTEXATTRIBPOINTERPROC)GLGetProcAddress("glVertexAttribPointer");
+    _glDisableVertexAttribArray = (PFNGLDISABLEVERTEXATTRIBARRAYPROC)GLGetProcAddress("glDisableVertexAttribArray");
+    _glGetVertexAttribiv = (PFNGLGETVERTEXATTRIBIVPROC)GLGetProcAddress("glGetVertexAttribiv");
+    _glGetVertexAttribPointerv = (PFNGLGETVERTEXATTRIBPOINTERVPROC)GLGetProcAddress("glGetVertexAttribPointerv");
+
     if (!_glGenBuffers || !_glDeleteBuffers || !_glBufferData ||
         !_glVertexAttribIPointer || !_glVertexAttribDivisor || !_glEnableVertexAttribArray ||
         !_glGetIntegerv || !_glGetAttribLocation ||
-        !_glGenVertexArrays || !_glDeleteVertexArrays || !_glBindVertexArray)
+        !_glGenVertexArrays || !_glDeleteVertexArrays || !_glBindVertexArray ||
+        !_glVertexAttribPointer || !_glDisableVertexAttribArray ||
+        !_glGetVertexAttribiv || !_glGetVertexAttribPointerv)
     {
         DebugLog("[MDI] GLES: failed to resolve GL functions\n");
         return false;
@@ -211,7 +220,31 @@ bool MDIBackend_GLES::ResizeInstanceIDBuffer(uint32_t newMaxCount)
 
     _maxInstanceCount = newMaxCount;
     CreateInstanceIDBuffer();
+
+    // Cached mesh-path VAO clones reference the old _instanceIDBuffer in their
+    // TEXCOORD7 binding — invalidate so they get rebuilt against the new buffer.
+    InvalidateMeshVAOCache();
+
+    // Force BindInstanceIDAttribute to re-resolve attribute location (and to
+    // re-bind the new identity buffer on the indexed-path _mdiVAO next call).
+    _cachedProgram = 0;
+    _cachedTexcoord7Location = -1;
+
     return _instanceIDBuffer != 0;
+}
+
+void MDIBackend_GLES::InvalidateMeshVAOCache()
+{
+    if (!_glDeleteVertexArrays) return;
+    for (auto& e : _meshVAOCache)
+    {
+        if (e.cloneVAO != 0)
+        {
+            _glDeleteVertexArrays(1, &e.cloneVAO);
+        }
+        e = MeshVAOCacheEntry{};
+    }
+    _meshVAOCacheNextSlot = 0;
 }
 
 bool MDIBackend_GLES::Initialize(IUnityInterfaces* unityInterfaces)
@@ -222,11 +255,20 @@ bool MDIBackend_GLES::Initialize(IUnityInterfaces* unityInterfaces)
         return false;
 
     _multiDrawIndirectSupported = CheckMultiDrawIndirectExtension();
+
+    // Query max vertex attribs (clamped to 32 to keep stack arrays sane).
+    GLint maxAttribs = 16;
+    _glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &maxAttribs);
+    if (maxAttribs <= 0)  maxAttribs = 16;
+    if (maxAttribs > 32)  maxAttribs = 32;
+    _maxVertexAttribs = maxAttribs;
+
     CreateInstanceIDBuffer();
 
     _initialized = true;
-    DebugLog("[MDI] GLES backend initialized (MDI: %s)\n",
-        _multiDrawIndirectSupported ? "hardware" : "loop fallback");
+    DebugLog("[MDI] GLES backend initialized (MDI: %s, maxAttribs: %d)\n",
+        _multiDrawIndirectSupported ? "hardware" : "loop fallback",
+        _maxVertexAttribs);
     return true;
 }
 
@@ -237,6 +279,7 @@ void MDIBackend_GLES::Shutdown()
         _glDeleteVertexArrays(1, &_mdiVAO);
         _mdiVAO = 0;
     }
+    InvalidateMeshVAOCache();
     if (_instanceIDBuffer && _glDeleteBuffers)
     {
         _glDeleteBuffers(1, &_instanceIDBuffer);
@@ -275,44 +318,172 @@ void MDIBackend_GLES::ExecuteMDI(const MDIParams& params)
     GLenum indexType = (params.indexFormat == 1) ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
     const uint32_t stride = 20; // 5 * sizeof(uint32_t)
 
-    // Save Unity's current VAO so we can restore it after MDI draw
-    GLint prevVAO = 0;
-    _glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVAO);
+    const bool meshPath = (params.flags & MDI_FLAG_MESH_PATH) != 0;
 
     // Lazy (re)creation of identity buffer
     if (_instanceIDBuffer == 0)
         CreateInstanceIDBuffer();
 
-    // Validate cached VAO — Unity may destroy GL objects on maximize/detach
-    // without firing device reset events. glIsVertexArray detects this.
-    if (_mdiVAO != 0 && !_glIsVertexArray(_mdiVAO))
+    // Both paths route through their own dedicated VAO and restore Unity's
+    // VAO on exit so we never pollute Unity's VAO state.
+    GLint prevVAO = 0;
+    _glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVAO);
+
+    if (meshPath)
     {
-        _mdiVAO = 0;
-        DebugLog("[MDI] GLES: VAO invalidated, recreating\n");
+        if (prevVAO == 0)
+        {
+            DebugLog("[MDI] GLES mesh path: no VAO bound by Unity, skipping\n");
+            return;
+        }
+        const GLuint unityVAO = static_cast<GLuint>(prevVAO);
+
+        // Lightweight fingerprint of Unity's VAO state. Catches the realistic
+        // invalidation cases:
+        //   • mesh re-upload: slot 0 buffer / pointer / element buffer change
+        //   • shader switch: GL_CURRENT_PROGRAM changes (TEXCOORD7 location may differ)
+        //   • mesh recreation: unityVAO ID changes
+        //   • identity-buffer resize: handled separately via InvalidateMeshVAOCache
+        GLint fpProgram = 0, fpSlot0Buffer = 0, fpSlot0Stride = 0, fpElementBuffer = 0;
+        void* fpSlot0Pointer = nullptr;
+        _glGetIntegerv(GL_CURRENT_PROGRAM, &fpProgram);
+        _glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &fpSlot0Buffer);
+        _glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &fpSlot0Stride);
+        _glGetVertexAttribPointerv(0, GL_VERTEX_ATTRIB_ARRAY_POINTER, &fpSlot0Pointer);
+        _glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &fpElementBuffer);
+
+        MeshVAOCacheEntry* hit = nullptr;
+        for (auto& e : _meshVAOCache)
+        {
+            if (e.unityVAOId == unityVAO && e.cloneVAO != 0 &&
+                e.fpProgram        == fpProgram &&
+                e.fpSlot0Buffer    == fpSlot0Buffer &&
+                e.fpSlot0Stride    == fpSlot0Stride &&
+                e.fpSlot0Pointer   == fpSlot0Pointer &&
+                e.fpElementBuffer  == fpElementBuffer &&
+                e.fpInstanceIDBuf  == _instanceIDBuffer)
+            {
+                hit = &e;
+                break;
+            }
+        }
+
+        if (hit && _glIsVertexArray(hit->cloneVAO))
+        {
+            // Fast path: TEXCOORD7 + cloned bindings are already on this VAO.
+            _glBindVertexArray(hit->cloneVAO);
+        }
+        else
+        {
+            // Slow path: clone Unity's VAO bindings into a clone VAO.
+            MeshVAOCacheEntry& slot = _meshVAOCache[_meshVAOCacheNextSlot];
+            _meshVAOCacheNextSlot = (_meshVAOCacheNextSlot + 1) % kMeshVAOCacheSize;
+
+            struct AttribSnapshot
+            {
+                GLint  enabled;
+                GLint  size;
+                GLint  stride;
+                GLint  type;
+                GLint  normalized;
+                GLint  isInteger;
+                GLint  divisor;
+                GLint  buffer;
+                void*  pointer;
+            };
+
+            // No zero-init — `enabled` is set first thing in the loop and gates
+            // reads of all other fields.
+            AttribSnapshot snapshots[32];
+            const int attribCount = _maxVertexAttribs;
+
+            for (int i = 0; i < attribCount; ++i)
+            {
+                _glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &snapshots[i].enabled);
+                if (!snapshots[i].enabled) continue;
+
+                _glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &snapshots[i].size);
+                _glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &snapshots[i].stride);
+                _glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_TYPE, &snapshots[i].type);
+                _glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &snapshots[i].normalized);
+                _glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_INTEGER, &snapshots[i].isInteger);
+                _glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_DIVISOR, &snapshots[i].divisor);
+                _glGetVertexAttribiv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &snapshots[i].buffer);
+                _glGetVertexAttribPointerv((GLuint)i, GL_VERTEX_ATTRIB_ARRAY_POINTER, &snapshots[i].pointer);
+            }
+
+            // Reuse the slot's existing clone VAO if still alive, otherwise create a new one.
+            if (slot.cloneVAO == 0 || !_glIsVertexArray(slot.cloneVAO))
+            {
+                if (slot.cloneVAO != 0) _glDeleteVertexArrays(1, &slot.cloneVAO);
+                _glGenVertexArrays(1, &slot.cloneVAO);
+            }
+            _glBindVertexArray(slot.cloneVAO);
+
+            for (int i = 0; i < attribCount; ++i)
+            {
+                if (!snapshots[i].enabled)
+                {
+                    _glDisableVertexAttribArray((GLuint)i);
+                    continue;
+                }
+
+                _glBindBuffer(GL_ARRAY_BUFFER, (GLuint)snapshots[i].buffer);
+                if (snapshots[i].isInteger)
+                {
+                    _glVertexAttribIPointer((GLuint)i,
+                        snapshots[i].size, (GLenum)snapshots[i].type,
+                        snapshots[i].stride, snapshots[i].pointer);
+                }
+                else
+                {
+                    _glVertexAttribPointer((GLuint)i,
+                        snapshots[i].size, (GLenum)snapshots[i].type,
+                        (GLboolean)snapshots[i].normalized,
+                        snapshots[i].stride, snapshots[i].pointer);
+                }
+                _glVertexAttribDivisor((GLuint)i, (GLuint)snapshots[i].divisor);
+                _glEnableVertexAttribArray((GLuint)i);
+            }
+            _glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, (GLuint)fpElementBuffer);
+
+            if (_instanceIDBuffer)
+                BindInstanceIDAttribute();
+
+            slot.unityVAOId       = unityVAO;
+            slot.fpProgram        = fpProgram;
+            slot.fpSlot0Buffer    = fpSlot0Buffer;
+            slot.fpSlot0Stride    = fpSlot0Stride;
+            slot.fpSlot0Pointer   = fpSlot0Pointer;
+            slot.fpElementBuffer  = fpElementBuffer;
+            slot.fpInstanceIDBuf  = _instanceIDBuffer;
+        }
+    }
+    else
+    {
+        // Indexed (procedural) path: shader pulls vertex data via SV_VertexID,
+        // so a minimal VAO suffices. Use our cached _mdiVAO.
+        if (_mdiVAO != 0 && !_glIsVertexArray(_mdiVAO))
+        {
+            _mdiVAO = 0;
+            DebugLog("[MDI] GLES: VAO invalidated, recreating\n");
+        }
+        if (_mdiVAO == 0)
+            _glGenVertexArrays(1, &_mdiVAO);
+
+        _glBindVertexArray(_mdiVAO);
+
+        if (params.indexBuffer)
+        {
+            GLuint indexBufferGL = static_cast<GLuint>(reinterpret_cast<uintptr_t>(params.indexBuffer));
+            _glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBufferGL);
+        }
+
+        if (_instanceIDBuffer)
+            BindInstanceIDAttribute();
     }
 
-    if (_mdiVAO == 0)
-        _glGenVertexArrays(1, &_mdiVAO);
-
-    // Bind our own VAO — all subsequent state changes are isolated from Unity
-    _glBindVertexArray(_mdiVAO);
-
-    // Bind caller's index buffer
-    if (params.indexBuffer)
-    {
-        GLuint indexBufferGL = static_cast<GLuint>(reinterpret_cast<uintptr_t>(params.indexBuffer));
-        _glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBufferGL);
-
-    }
-
-    // Bind identity buffer to TEXCOORD7 as per-instance data
-    if (_instanceIDBuffer)
-    {
-        BindInstanceIDAttribute();
-
-    }
-
-    // Bind the indirect args buffer
+    // Bind the indirect args buffer (global GL state, not VAO state).
     _glBindBuffer(GL_DRAW_INDIRECT_BUFFER, argsBufferGL);
 
     const auto drawMode = GetDrawMode(params.topology);
@@ -326,7 +497,6 @@ void MDIBackend_GLES::ExecuteMDI(const MDIParams& params)
             static_cast<GLsizei>(params.maxDrawCount),
             static_cast<GLsizei>(stride)
         );
-
     }
     else
     {
@@ -340,10 +510,9 @@ void MDIBackend_GLES::ExecuteMDI(const MDIParams& params)
             );
             offset += stride;
         }
-
     }
 
-    // Restore Unity's state
+    // Restore state — leaves Unity's VAO and GL_DRAW_INDIRECT_BUFFER as they were.
     _glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
     _glBindVertexArray(static_cast<GLuint>(prevVAO));
 }

@@ -116,7 +116,7 @@ namespace Saivs.Graphics.Core.MDI
                 // this draw owns. The slot is encoded in the prime's argsOffset
                 // — the Metal backend reads it back from inside its
                 // drawIndexedPrimitives swizzle hook.
-                IntPtr dataPtr = WriteParams(bufferWithArgs, indexBuffer, argsStartIndex, argsCount, topology, indexFormat: 1, out int slot);
+                IntPtr dataPtr = WriteParams(bufferWithArgs, indexBuffer, argsStartIndex, argsCount, topology, indexFormat: 1, flags: 0, out int slot);
 
                 // Prime draw: sets PSO + render state on the command list.
                 // On D3D11/D3D12, use a Mesh with TEXCOORD7 to force a PSO whose

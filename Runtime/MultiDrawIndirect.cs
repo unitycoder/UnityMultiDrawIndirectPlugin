@@ -31,7 +31,10 @@ namespace Saivs.Graphics.Core.MDI
         private const int INDIRECT_DRAW_INDEXED_ARGS_SIZE = 20; // 5 * sizeof(uint)
         private const int MAX_PENDING = 256;
 
-        // Must match native MDIParams layout (two pointers + four uint32)
+        // MDIParams flags — must match MDI_FLAG_* in MDIBackend.h.
+        private const uint MDI_FLAG_MESH_PATH = 1u << 0;
+
+        // Must match native MDIParams layout (two pointers + six uint32, last one is padding).
         [StructLayout(LayoutKind.Sequential)]
         private struct NativeMDIParams
         {
@@ -41,6 +44,8 @@ namespace Saivs.Graphics.Core.MDI
             public uint maxDrawCount;
             public uint indexFormat;
             public uint topology;
+            public uint flags;
+            public uint _pad;
         }
 
         // Native imports
@@ -209,6 +214,7 @@ namespace Saivs.Graphics.Core.MDI
             int argsCount,
             MeshTopology topology,
             uint indexFormat,
+            uint flags,
             out int slot)
         {
             slot = MDI_AllocSlot();
@@ -221,6 +227,8 @@ namespace Saivs.Graphics.Core.MDI
                 maxDrawCount = (uint)argsCount,
                 indexFormat = indexFormat,
                 topology = (uint)topology,
+                flags = flags,
+                _pad = 0,
             };
 
             return (IntPtr)((NativeMDIParams*)_paramsRing.GetUnsafeReadOnlyPtr() + slot);

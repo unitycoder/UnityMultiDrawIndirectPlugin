@@ -28,8 +28,12 @@ private:
     PFNGLDELETEBUFFERSPROC _glDeleteBuffers = nullptr;
     PFNGLBUFFERDATAPROC _glBufferData = nullptr;
     PFNGLVERTEXATTRIBIPOINTERPROC _glVertexAttribIPointer = nullptr;
+    PFNGLVERTEXATTRIBPOINTERPROC _glVertexAttribPointer = nullptr;
     PFNGLVERTEXATTRIBDIVISORPROC _glVertexAttribDivisor = nullptr;
     PFNGLENABLEVERTEXATTRIBARRAYPROC _glEnableVertexAttribArray = nullptr;
+    PFNGLDISABLEVERTEXATTRIBARRAYPROC _glDisableVertexAttribArray = nullptr;
+    PFNGLGETVERTEXATTRIBIVPROC _glGetVertexAttribiv = nullptr;
+    PFNGLGETVERTEXATTRIBPOINTERVPROC _glGetVertexAttribPointerv = nullptr;
     PFNGLGETINTEGERVPROC _glGetIntegerv = nullptr;
     PFNGLGETATTRIBLOCATIONPROC _glGetAttribLocation = nullptr;
     PFNGLGETERRORPROC _glGetError = nullptr;
@@ -41,8 +45,33 @@ private:
     // Per-instance identity buffer [0, 1, 2, ..., _maxInstanceCount-1]
     GLuint _instanceIDBuffer = 0;
 
-    // Cached VAO for MDI draws — validated via glIsVertexArray before use
+    // Cached VAO for indexed (procedural) MDI draws — validated via glIsVertexArray.
     GLuint _mdiVAO = 0;
+
+    // Mesh-path VAO clone cache. We clone Unity's mesh VAO into our own VAO
+    // (so we can add TEXCOORD7 without polluting Unity's state) and reuse it
+    // across calls when Unity's VAO hasn't changed. Lightweight fingerprint
+    // (slot 0 binding + element buffer + program + identity buffer ID)
+    // detects mesh re-upload / shader switch / identity-buffer resize.
+    struct MeshVAOCacheEntry
+    {
+        GLuint  unityVAOId       = 0;
+        GLuint  cloneVAO         = 0;
+        GLint   fpProgram        = 0;
+        GLint   fpSlot0Buffer    = 0;
+        GLint   fpSlot0Stride    = 0;
+        void*   fpSlot0Pointer   = nullptr;
+        GLint   fpElementBuffer  = 0;
+        GLuint  fpInstanceIDBuf  = 0;
+    };
+    static constexpr int kMeshVAOCacheSize = 4;
+    MeshVAOCacheEntry _meshVAOCache[kMeshVAOCacheSize];
+    int _meshVAOCacheNextSlot = 0;
+
+    void InvalidateMeshVAOCache();
+
+    // Max attribute slots; queried once and clamped to a sane upper bound.
+    int _maxVertexAttribs = 16;
 
     // Cached TEXCOORD7 attribute location per shader program
     GLuint _cachedProgram = 0;
