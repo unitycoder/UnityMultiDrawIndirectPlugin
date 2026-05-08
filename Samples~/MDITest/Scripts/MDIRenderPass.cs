@@ -8,6 +8,17 @@ namespace Saivs.Graphics.Test
 {
     public class MDIRenderPass : ScriptableRenderPass
     {
+        // Pass indices in MDIIndexedTestShader.shader:
+        //   0 — RenderPrimitivesForward          (UniversalForward, indexed)
+        //   1 — MDIIndexedForward                (indexed, MDI plugin)
+        //   2 — ProceduralLoopForward            (indexed, managed loop)
+        //   3 — MDIMeshForward                   (mesh,    MDI plugin)
+        //   4 — DrawMeshInstancedIndirectForward (mesh,    managed loop)
+        private const int PASS_MDI_INDEXED = 1;
+        private const int PASS_PROCEDURAL_LOOP = 2;
+        private const int PASS_MDI_MESH = 3;
+        private const int PASS_MESH_LOOP = 4;
+
         private static readonly int DrawCallIndexID = Shader.PropertyToID("_DrawCallIndex");
 
         private GraphicsBuffer _indexBuffer;
@@ -16,6 +27,7 @@ namespace Saivs.Graphics.Test
         private MaterialPropertyBlock _mpb;
         private int _drawCount;
         private MDITestController.DrawMode _drawMode;
+        private Mesh _combinedMesh;
 
         public MDIRenderPass()
         {
@@ -28,7 +40,8 @@ namespace Saivs.Graphics.Test
             Material material,
             MaterialPropertyBlock mpb,
             int drawCount,
-            MDITestController.DrawMode drawMode)
+            MDITestController.DrawMode drawMode,
+            Mesh combinedMesh)
         {
             _indexBuffer = indexBuffer;
             _argsBuffer = argsBuffer;
@@ -36,6 +49,7 @@ namespace Saivs.Graphics.Test
             _mpb = mpb;
             _drawCount = drawCount;
             _drawMode = drawMode;
+            _combinedMesh = combinedMesh;
         }
 
         private class PassData
@@ -46,6 +60,7 @@ namespace Saivs.Graphics.Test
             public MaterialPropertyBlock mpb;
             public int drawCount;
             public MDITestController.DrawMode drawMode;
+            public Mesh combinedMesh;
         }
 
         public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
@@ -62,6 +77,7 @@ namespace Saivs.Graphics.Test
             passData.mpb = _mpb;
             passData.drawCount = _drawCount;
             passData.drawMode = _drawMode;
+            passData.combinedMesh = _combinedMesh;
 
             builder.SetRenderAttachment(resourceData.activeColorTexture, 0);
             builder.SetRenderAttachmentDepth(resourceData.activeDepthTexture);
@@ -75,33 +91,66 @@ namespace Saivs.Graphics.Test
 
         private static void Render(RasterCommandBuffer cmd, PassData data)
         {
-            if (data.drawMode == MDITestController.DrawMode.MultiDrawIndirect)
+            switch (data.drawMode)
             {
-                cmd.MultiDrawIndexedIndirect(
-                    indexBuffer: data.indexBuffer,
-                    material: data.material,
-                    properties: data.mpb,
-                    shaderPass: 1,
-                    topology: MeshTopology.Triangles,
-                    bufferWithArgs: data.argsBuffer,
-                    argsStartIndex: 0,
-                    argsCount: data.drawCount);
-            }
-            else
-            {
-                for (int i = 0; i < data.drawCount; i++)
-                {
-                    cmd.SetGlobalInt(DrawCallIndexID, i);
-                    cmd.DrawProceduralIndirect(
+                // -------- Indexed track --------
+                case MDITestController.DrawMode.MultiDrawIndexedIndirect:
+                    cmd.MultiDrawIndexedIndirect(
                         indexBuffer: data.indexBuffer,
-                        matrix: Matrix4x4.identity,
                         material: data.material,
-                        shaderPass: 2,
+                        properties: data.mpb,
+                        shaderPass: PASS_MDI_INDEXED,
                         topology: MeshTopology.Triangles,
                         bufferWithArgs: data.argsBuffer,
-                        argsOffset: i * GraphicsBuffer.IndirectDrawIndexedArgs.size,
-                        properties: data.mpb);
-                }
+                        argsStartIndex: 0,
+                        argsCount: data.drawCount);
+                    break;
+
+                case MDITestController.DrawMode.ProceduralIndirectLoop:
+                    for (int i = 0; i < data.drawCount; i++)
+                    {
+                        cmd.SetGlobalInt(DrawCallIndexID, i);
+                        cmd.DrawProceduralIndirect(
+                            indexBuffer: data.indexBuffer,
+                            matrix: Matrix4x4.identity,
+                            material: data.material,
+                            shaderPass: PASS_PROCEDURAL_LOOP,
+                            topology: MeshTopology.Triangles,
+                            bufferWithArgs: data.argsBuffer,
+                            argsOffset: i * GraphicsBuffer.IndirectDrawIndexedArgs.size,
+                            properties: data.mpb);
+                    }
+                    break;
+
+                // -------- Mesh track --------
+                case MDITestController.DrawMode.MultiDrawMeshIndirect:
+                    cmd.MultiDrawMeshIndirect(
+                        mesh: data.combinedMesh,
+                        material: data.material,
+                        properties: data.mpb,
+                        shaderPass: PASS_MDI_MESH,
+                        bufferWithArgs: data.argsBuffer,
+                        argsStartIndex: 0,
+                        argsCount: data.drawCount);
+                    break;
+
+                case MDITestController.DrawMode.DrawMeshInstancedIndirect:
+                    for (int i = 0; i < data.drawCount; i++)
+                    {
+                        cmd.SetGlobalInt(DrawCallIndexID, i);
+                        cmd.DrawMeshInstancedIndirect(
+                            mesh: data.combinedMesh,
+                            submeshIndex: 0,
+                            material: data.material,
+                            shaderPass: PASS_MESH_LOOP,
+                            bufferWithArgs: data.argsBuffer,
+                            argsOffset: i * GraphicsBuffer.IndirectDrawIndexedArgs.size,
+                            properties: data.mpb);
+                    }
+                    break;
+
+                // RenderPrimitivesIndexedIndirect / RenderMeshIndirect are dispatched
+                // directly from the controller via Graphics.* and never reach here.
             }
         }
     }

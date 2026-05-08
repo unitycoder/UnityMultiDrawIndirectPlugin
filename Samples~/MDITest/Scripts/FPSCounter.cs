@@ -42,10 +42,13 @@ namespace Saivs.Graphics.Test
                 };
             }
 
-            var drawMode = _controller != null ? _controller.CurrentDrawMode : MDITestController.DrawMode.MultiDrawIndirect;
+            var drawMode = _controller != null ? _controller.CurrentDrawMode : MDITestController.DrawMode.MultiDrawIndexedIndirect;
             var drawCount = _controller != null ? _controller.BufferManager.DrawCount : 0;
 
-            _guiStyle.normal.textColor = (drawMode == MDITestController.DrawMode.MultiDrawIndirect)
+            bool isPluginMode = drawMode == MDITestController.DrawMode.MultiDrawIndexedIndirect
+                             || drawMode == MDITestController.DrawMode.MultiDrawMeshIndirect;
+
+            _guiStyle.normal.textColor = isPluginMode
                 ? new Color(0f, 0.9f, 0.1f)
                 : new Color(0.9f, 0f, 0.1f);
 

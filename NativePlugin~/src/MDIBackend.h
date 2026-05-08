@@ -3,6 +3,9 @@
 #include <cstdint>
 #include "Unity/IUnityInterface.h"
 
+// flags bitfield for MDIParams
+static constexpr uint32_t MDI_FLAG_MESH_PATH = 1u << 0; // user-supplied mesh (vs. procedural / indexed)
+
 // Shared parameter struct for MDI calls
 struct MDIParams
 {
@@ -12,6 +15,8 @@ struct MDIParams
     uint32_t maxDrawCount;        // Number of draw commands to execute
     uint32_t indexFormat;         // 0 = R16_UINT, 1 = R32_UINT
     uint32_t topology;            // 0 - triangle list, 3 - line list, 4 - line strip, 5 - point list
+    uint32_t flags;               // MDI_FLAG_* bitfield
+    uint32_t _pad;                // pad to 8-byte alignment (matches C# NativeMDIParams)
 };
 
 static constexpr int MDI_MAX_PENDING = 256;

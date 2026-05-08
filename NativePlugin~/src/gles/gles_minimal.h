@@ -80,6 +80,23 @@ typedef void (GL_APIENTRY *PFNGLENABLEVERTEXATTRIBARRAYPROC)(GLuint index);
 #define GL_VERTEX_ARRAY_BINDING           0x85B5
 #define GL_ELEMENT_ARRAY_BUFFER_BINDING   0x8895
 
+// Vertex attribute query parameters
+#define GL_VERTEX_ATTRIB_ARRAY_ENABLED         0x8622
+#define GL_VERTEX_ATTRIB_ARRAY_SIZE            0x8623
+#define GL_VERTEX_ATTRIB_ARRAY_STRIDE          0x8624
+#define GL_VERTEX_ATTRIB_ARRAY_TYPE            0x8625
+#define GL_VERTEX_ATTRIB_ARRAY_NORMALIZED      0x886A
+#define GL_VERTEX_ATTRIB_ARRAY_INTEGER         0x88FD
+#define GL_VERTEX_ATTRIB_ARRAY_DIVISOR         0x88FE
+#define GL_VERTEX_ATTRIB_ARRAY_POINTER         0x8645
+#define GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING  0x889F
+#define GL_MAX_VERTEX_ATTRIBS                  0x8869
+
+typedef void (GL_APIENTRY *PFNGLGETVERTEXATTRIBIVPROC)(GLuint index, GLenum pname, GLint* params);
+typedef void (GL_APIENTRY *PFNGLGETVERTEXATTRIBPOINTERVPROC)(GLuint index, GLenum pname, void** pointer);
+typedef void (GL_APIENTRY *PFNGLDISABLEVERTEXATTRIBARRAYPROC)(GLuint index);
+typedef void (GL_APIENTRY *PFNGLVERTEXATTRIBPOINTERPROC)(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void* pointer);
+
 // Error checking
 #define GL_NO_ERROR                       0
 typedef GLenum (GL_APIENTRY *PFNGLGETERRORPROC)();

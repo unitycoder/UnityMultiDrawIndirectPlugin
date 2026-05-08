@@ -1,35 +1,40 @@
 using System;
-using System.Reflection;
-using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 using UnityEngine.Rendering;
 
-#if UNITY_6000_0_OR_NEWER
-using UnityEngine.Rendering.RenderGraphModule;
-#endif
-
 namespace Saivs.Graphics.Core.MDI
 {
     /// <summary>
-    /// Native Multi-Draw Indirect plugin bridge (D3D11, D3D12, Vulkan, OpenGLES, OpenGL).
+    /// Native Multi-Draw Indirect plugin bridge (D3D11, D3D12, Vulkan, OpenGLES, OpenGL, Metal, WebGPU).
     ///
     /// Flow (identical for all APIs):
-    /// 1. DrawProceduralIndirect with dummy args (instanceCount=0) — binds PSO, render targets, shaders.
+    /// 1. Prime draw with dummy args (instanceCount=0) — binds PSO, render targets, shaders.
     /// 2. IssuePluginEventAndData — plugin receives params via pinned ring buffer pointer.
     ///    - D3D11: NvAPI hardware MDI or native DrawIndexedInstancedIndirect loop.
     ///    - D3D12: ExecuteIndirect on Unity's command list via CommandRecordingState.
     ///    - Vulkan: vkCmdDrawIndexedIndirect (multi-draw if supported, loop fallback otherwise).
+    ///    - Metal: drawIndexedPrimitives:indirectBuffer: dispatched from inside a method-swizzle hook.
+    ///
+    /// The class is split across several partial files:
+    ///   • MultiDrawIndirect.cs                  — core state, init/dispose, shared helpers.
+    ///   • MultiDrawIndirect_Indexed.cs          — CommandBuffer.MultiDrawIndexedIndirect + prime-mesh helpers.
+    ///   • MultiDrawIndirect_Mesh.cs             — CommandBuffer.MultiDrawMeshIndirect + mesh helpers.
+    ///   • MultiDrawIndirect_RenderGraphIndexed.cs — RasterCommandBuffer / UnsafeCommandBuffer indexed overloads (Unity 6).
+    ///   • MultiDrawIndirect_RenderGraphMesh.cs    — RasterCommandBuffer / UnsafeCommandBuffer mesh overloads (Unity 6).
     /// </summary>
-    public static class MultiDrawIndirect
+    public static partial class MultiDrawIndirect
     {
         private const string DLL_NAME = "GfxPluginMDI";
         private const int INDIRECT_DRAW_INDEXED_ARGS_SIZE = 20; // 5 * sizeof(uint)
         private const int MAX_PENDING = 256;
 
-        // Must match native MDIParams layout (two pointers + three uint32)
+        // MDIParams flags — must match MDI_FLAG_* in MDIBackend.h.
+        private const uint MDI_FLAG_MESH_PATH = 1u << 0;
+
+        // Must match native MDIParams layout (two pointers + six uint32, last one is padding).
         [StructLayout(LayoutKind.Sequential)]
         private struct NativeMDIParams
         {
@@ -39,6 +44,8 @@ namespace Saivs.Graphics.Core.MDI
             public uint maxDrawCount;
             public uint indexFormat;
             public uint topology;
+            public uint flags;
+            public uint _pad;
         }
 
         // Native imports
@@ -61,7 +68,7 @@ namespace Saivs.Graphics.Core.MDI
         // Pinned ring buffer for IssuePluginEventAndData — stable pointers for render thread
         private static NativeArray<NativeMDIParams> _paramsRing;
 
-        // dummy args buffer (instanceCount=0) for zero-pixel prime draw
+        // Dummy args buffer (instanceCount=0) for the zero-pixel prime draw
         private static GraphicsBuffer _dummyArgsBuffer;
 
         // Per-draw index buffer used by the Metal backend. Holds [0, 1, …, MAX_PENDING-1]
@@ -70,6 +77,12 @@ namespace Saivs.Graphics.Core.MDI
         // No-op on other platforms.
         private static GraphicsBuffer _drawIndexBuffer;
         private static readonly int s_DrawIndexBufferID = Shader.PropertyToID("_MDI_DrawIndex_Buffer");
+
+        // Per-feature lifecycle hooks implemented in the corresponding partial files.
+        // Empty (compile to no-op) if the partial isn't compiled in this build.
+        static partial void InitIndexedState();
+        static partial void DisposeIndexedState();
+        static partial void DisposeMeshState();
 
         public static bool IsSupported
         {
@@ -122,7 +135,7 @@ namespace Saivs.Graphics.Core.MDI
             {
                 _supported = MDI_IsSupported() != 0;
 
-                _primeMeshes = new Dictionary<MeshTopology, Mesh>();
+                InitIndexedState();
 
                 if (_supported)
                 {
@@ -186,21 +199,22 @@ namespace Saivs.Graphics.Core.MDI
             _drawIndexBuffer?.Dispose();
             _drawIndexBuffer = null;
 
-            foreach (var pair in _primeMeshes)
-                UnityEngine.Object.DestroyImmediate(pair.Value);
-
-            _primeMeshes.Clear();
+            DisposeIndexedState();
+            DisposeMeshState();
 
             _initialized = false;
         }
 
-        // Write params to pinned ring buffer, return stable pointer for render thread
+        // Write params to the pinned ring buffer; return a stable pointer for the
+        // render thread. Used by both the indexed and mesh draw paths.
         private static unsafe IntPtr WriteParams(
             GraphicsBuffer bufferWithArgs,
             GraphicsBuffer indexBuffer,
             int argsStartIndex,
             int argsCount,
             MeshTopology topology,
+            uint indexFormat,
+            uint flags,
             out int slot)
         {
             slot = MDI_AllocSlot();
@@ -211,209 +225,13 @@ namespace Saivs.Graphics.Core.MDI
                 indexBuffer = indexBuffer.GetNativeBufferPtr(),
                 argsOffsetBytes = (uint)(argsStartIndex * INDIRECT_DRAW_INDEXED_ARGS_SIZE),
                 maxDrawCount = (uint)argsCount,
-                indexFormat = 1, // R32_UINT
+                indexFormat = indexFormat,
                 topology = (uint)topology,
+                flags = flags,
+                _pad = 0,
             };
 
             return (IntPtr)((NativeMDIParams*)_paramsRing.GetUnsafeReadOnlyPtr() + slot);
         }
-
-        // -----------------------------------------------------------------------
-        // CommandBuffer extension
-        // -----------------------------------------------------------------------
-        private static bool _usesPerInstanceVB;
-        private static bool _perInstanceVBChecked;
-        private static Dictionary<MeshTopology, Mesh> _primeMeshes;
-
-        private static bool UsesPerInstanceVB
-        {
-            get
-            {
-                if (!_perInstanceVBChecked)
-                {
-                    _perInstanceVBChecked = true;
-                    try { _usesPerInstanceVB = _supported && MDI_UsesPerInstanceVB() != 0; }
-                    catch { _usesPerInstanceVB = false; }
-                }
-                return _usesPerInstanceVB;
-            }
-        }
-
-        // Create a minimal mesh whose vertex layout includes TEXCOORD7.
-        // When Unity renders this mesh, it creates a PSO with TEXCOORD7
-        // in the input layout — our native hook then modifies it to be
-        // per-instance on VB slot 15.
-        private static Mesh GetPrimeMesh(MeshTopology topology)
-        {
-            if (_primeMeshes.TryGetValue(topology, out var mesh))
-                return mesh;
-
-            mesh = new Mesh {
-                name = $"MDI_PrimeMesh_{topology}",
-                hideFlags = HideFlags.HideAndDontSave
-            };
-
-            mesh.SetVertexBufferParams(3,
-                new VertexAttributeDescriptor(VertexAttribute.Position, VertexAttributeFormat.Float32, 3, stream: 0),
-                new VertexAttributeDescriptor(VertexAttribute.TexCoord7, VertexAttributeFormat.UInt32, 1, stream: 1)
-            );
-
-            mesh.SetVertexBufferData(new Vector3[3], 0, 0, 3, stream: 0);
-            mesh.SetVertexBufferData(new uint[3], 0, 0, 3, stream: 1);
-
-            // Set the indices based on the requested topology
-            switch (topology)
-            {
-                case MeshTopology.Lines:
-                    mesh.SetIndices(new int[] { 0, 1 }, MeshTopology.Lines, 0);
-                    break;
-                case MeshTopology.Points:
-                    mesh.SetIndices(new int[] { 0 }, MeshTopology.Points, 0);
-                    break;
-                case MeshTopology.Triangles:
-                default:
-                    mesh.SetIndices(new int[] { 0, 1, 2 }, MeshTopology.Triangles, 0);
-                    break;
-            }
-
-            mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 10000);
-
-            _primeMeshes[topology] = mesh;
-
-            return mesh;
-        }
-
-        public static void MultiDrawIndexedIndirect(
-            this CommandBuffer cmd,
-            GraphicsBuffer indexBuffer,
-            Material material,
-            MaterialPropertyBlock properties,
-            int shaderPass,
-            MeshTopology topology,
-            GraphicsBuffer bufferWithArgs,
-            int argsStartIndex,
-            int argsCount)
-        {
-            EnsureInitialized();
-
-            if (_supported && argsCount > 1)
-            {
-                // Stage params into the ring buffer FIRST so we know which slot
-                // this draw owns. The slot is encoded in the prime's argsOffset
-                // — the Metal backend reads it back from inside its
-                // drawIndexedPrimitives swizzle hook.
-                IntPtr dataPtr = WriteParams(bufferWithArgs, indexBuffer, argsStartIndex, argsCount, topology, out int slot);
-
-                // Prime draw: sets PSO + render state on the command list.
-                // On D3D11/D3D12, use a Mesh with TEXCOORD7 to force a PSO whose
-                // input layout includes TEXCOORD7 (our hook patches it to
-                // per-instance on VB slot 15). Zero-area triangle = no pixels.
-                if (UsesPerInstanceVB)
-                    cmd.DrawMesh(GetPrimeMesh(topology), Matrix4x4.identity, material, 0, shaderPass, properties);
-                else
-                    cmd.DrawProceduralIndirect(
-                        indexBuffer: indexBuffer, matrix: Matrix4x4.identity, material: material,
-                        shaderPass: shaderPass, topology: topology, bufferWithArgs: _dummyArgsBuffer,
-                        argsOffset: slot * INDIRECT_DRAW_INDEXED_ARGS_SIZE, properties: properties);
-
-                cmd.IssuePluginEventAndData(_renderEventAndDataFunc, _baseEventID + slot, dataPtr);
-            }
-            else
-            {
-                for (int i = 0; i < argsCount; i++)
-                {
-                    cmd.DrawProceduralIndirect(
-                        indexBuffer: indexBuffer, matrix: Matrix4x4.identity, material: material,
-                        shaderPass: shaderPass, topology: topology, bufferWithArgs: bufferWithArgs,
-                        argsOffset: (argsStartIndex + i) * INDIRECT_DRAW_INDEXED_ARGS_SIZE, properties: properties);
-                }
-            }
-        }
-
-#if UNITY_6000_0_OR_NEWER
-        // -----------------------------------------------------------------------
-        // RasterCommandBuffer extension
-        // -----------------------------------------------------------------------
-        public static void MultiDrawIndexedIndirect(
-            this RasterCommandBuffer cmd,
-            GraphicsBuffer indexBuffer,
-            Material material,
-            MaterialPropertyBlock properties,
-            int shaderPass,
-            MeshTopology topology,
-            GraphicsBuffer bufferWithArgs,
-            int argsStartIndex,
-            int argsCount)
-        {
-            EnsureInitialized();
-
-            if (_supported && argsCount > 1)
-            {
-                IntPtr dataPtr = WriteParams(bufferWithArgs, indexBuffer, argsStartIndex, argsCount, topology, out int slot);
-
-                if (UsesPerInstanceVB)
-                    cmd.DrawMesh(GetPrimeMesh(topology), Matrix4x4.identity, material, 0, shaderPass, properties);
-                else
-                    cmd.DrawProceduralIndirect(
-                        indexBuffer: indexBuffer, matrix: Matrix4x4.identity, material: material,
-                        shaderPass: shaderPass, topology: topology, bufferWithArgs: _dummyArgsBuffer,
-                        argsOffset: slot * INDIRECT_DRAW_INDEXED_ARGS_SIZE, properties: properties);
-
-                cmd.IssuePluginEventAndData(_renderEventAndDataFunc, _baseEventID + slot, dataPtr);
-            }
-            else
-            {
-                for (int i = 0; i < argsCount; i++)
-                {
-                    cmd.DrawProceduralIndirect(
-                        indexBuffer: indexBuffer, matrix: Matrix4x4.identity, material: material,
-                        shaderPass: shaderPass, topology: topology, bufferWithArgs: bufferWithArgs,
-                        argsOffset: (argsStartIndex + i) * INDIRECT_DRAW_INDEXED_ARGS_SIZE, properties: properties);
-                }
-            }
-        }
-
-        // -----------------------------------------------------------------------
-        // UnsafeCommandBuffer extension
-        // -----------------------------------------------------------------------
-        public static void MultiDrawIndexedIndirect(
-            this UnsafeCommandBuffer cmd,
-            GraphicsBuffer indexBuffer,
-            Material material,
-            MaterialPropertyBlock properties,
-            int shaderPass,
-            MeshTopology topology,
-            GraphicsBuffer bufferWithArgs,
-            int argsStartIndex,
-            int argsCount)
-        {
-            EnsureInitialized();
-
-            if (_supported && argsCount > 1)
-            {
-                IntPtr dataPtr = WriteParams(bufferWithArgs, indexBuffer, argsStartIndex, argsCount, topology, out int slot);
-
-                if (UsesPerInstanceVB)
-                    cmd.DrawMesh(GetPrimeMesh(topology), Matrix4x4.identity, material, 0, shaderPass, properties);
-                else
-                    cmd.DrawProceduralIndirect(
-                        indexBuffer: indexBuffer, matrix: Matrix4x4.identity, material: material,
-                        shaderPass: shaderPass, topology: topology, bufferWithArgs: _dummyArgsBuffer,
-                        argsOffset: slot * INDIRECT_DRAW_INDEXED_ARGS_SIZE, properties: properties);
-
-                cmd.IssuePluginEventAndData(_renderEventAndDataFunc, _baseEventID + slot, dataPtr);
-            }
-            else
-            {
-                for (int i = 0; i < argsCount; i++)
-                {
-                    cmd.DrawProceduralIndirect(
-                        indexBuffer: indexBuffer, matrix: Matrix4x4.identity, material: material,
-                        shaderPass: shaderPass, topology: topology, bufferWithArgs: bufferWithArgs,
-                        argsOffset: (argsStartIndex + i) * INDIRECT_DRAW_INDEXED_ARGS_SIZE, properties: properties);
-                }
-            }
-        }
-#endif
     }
 }
