@@ -148,6 +148,15 @@ namespace Saivs.Graphics.Core.MDI
             if (_initialized) return;
             _initialized = true;
 
+            // Auto-cleanup: without these hooks, domain reload (entering Play
+            // Mode, recompiling) silently nulls our static caches while leaving
+            // native GraphicsBuffer / NativeArray allocations orphaned.
+            Application.quitting += Dispose;
+#if UNITY_EDITOR
+            UnityEditor.AssemblyReloadEvents.beforeAssemblyReload += Dispose;
+            UnityEditor.EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+#endif
+
             try
             {
                 // Route native plugin logs into Unity console BEFORE anything
@@ -229,8 +238,27 @@ namespace Saivs.Graphics.Core.MDI
             DisposeIndexedState();
             DisposeMeshState();
 
+            Application.quitting -= Dispose;
+#if UNITY_EDITOR
+            UnityEditor.AssemblyReloadEvents.beforeAssemblyReload -= Dispose;
+            UnityEditor.EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
+#endif
+
             _initialized = false;
         }
+
+#if UNITY_EDITOR
+        // Dispose on every Play Mode boundary. Even with "Reload Domain"
+        // disabled in Enter Play Mode Settings — when assembly reload doesn't
+        // fire — we still want to drop edit-mode mesh index buffers, since
+        // edit-mode mesh assets may be unloaded once Play Mode starts.
+        private static void OnPlayModeStateChanged(UnityEditor.PlayModeStateChange change)
+        {
+            if (change == UnityEditor.PlayModeStateChange.ExitingEditMode ||
+                change == UnityEditor.PlayModeStateChange.ExitingPlayMode)
+                Dispose();
+        }
+#endif
 
         // Write params to the pinned ring buffer; return a stable pointer for the
         // render thread. Used by both the indexed and mesh draw paths.

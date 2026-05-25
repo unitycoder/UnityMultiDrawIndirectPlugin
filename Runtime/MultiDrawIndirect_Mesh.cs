@@ -25,10 +25,11 @@ namespace Saivs.Graphics.Core.MDI
         // Mesh-only state
         // -----------------------------------------------------------------------
 
-        // Mesh instance IDs whose `indexBufferTarget` we've already augmented
-        // with Raw, so `mesh.GetIndexBuffer()` returns a buffer the native
-        // plugin can address.
-        private static readonly HashSet<int> _meshesPrepared = new HashSet<int>();
+        // Cache of index buffers per mesh. Mesh.GetIndexBuffer() returns a
+        // new GraphicsBuffer the caller must Dispose — calling it every frame
+        // leaks the wrapper. We allocate once per mesh and dispose all on
+        // shutdown. Key is mesh.GetInstanceID().
+        private static readonly Dictionary<int, GraphicsBuffer> _meshIndexBuffers = new Dictionary<int, GraphicsBuffer>();
         private static bool _meshFallbackWarned;
 
         // True when the current backend's MDI.hlsl branch routes the global
@@ -51,7 +52,9 @@ namespace Saivs.Graphics.Core.MDI
 
         static partial void DisposeMeshState()
         {
-            _meshesPrepared.Clear();
+            foreach (var kv in _meshIndexBuffers)
+                kv.Value?.Dispose();
+            _meshIndexBuffers.Clear();
             _meshFallbackWarned = false;
         }
 
@@ -63,12 +66,13 @@ namespace Saivs.Graphics.Core.MDI
         private static GraphicsBuffer EnsureMeshIndexBuffer(Mesh mesh)
         {
             int id = mesh.GetInstanceID();
-            if (!_meshesPrepared.Contains(id))
-            {
-                mesh.indexBufferTarget |= GraphicsBuffer.Target.Raw;
-                _meshesPrepared.Add(id);
-            }
-            return mesh.GetIndexBuffer();
+            if (_meshIndexBuffers.TryGetValue(id, out var cached))
+                return cached;
+
+            mesh.indexBufferTarget |= GraphicsBuffer.Target.Raw;
+            var buffer = mesh.GetIndexBuffer();
+            _meshIndexBuffers[id] = buffer;
+            return buffer;
         }
 
         private static void WarnMeshFallbackOnce()
