@@ -44,7 +44,7 @@ namespace Saivs.Graphics.Test
             _mdiRenderPass = new MDIRenderPass();
             RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
         }
-
+        
         private void OnDisable()
         {
             RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
@@ -54,16 +54,38 @@ namespace Saivs.Graphics.Test
         {
             if (Input.GetKeyDown(KeyCode.Space))
             {
-                _drawMode = _drawMode switch
-                {
-                    DrawMode.MultiDrawIndexedIndirect       => DrawMode.ProceduralIndirectLoop,
-                    DrawMode.ProceduralIndirectLoop          => DrawMode.RenderPrimitivesIndexedIndirect,
-                    DrawMode.RenderPrimitivesIndexedIndirect => DrawMode.MultiDrawMeshIndirect,
-                    DrawMode.MultiDrawMeshIndirect           => DrawMode.DrawMeshInstancedIndirect,
-                    DrawMode.DrawMeshInstancedIndirect       => DrawMode.RenderMeshIndirect,
-                    _                                        => DrawMode.MultiDrawIndexedIndirect,
-                };
+                NextDrawMode();
             }
+        }
+        public void SetMaxFps30()
+        {
+            Application.targetFrameRate = 30;
+        }
+
+        public void SetMaxFps60()
+        {
+            Application.targetFrameRate = 60;
+        }
+
+        public void SetMaxFps120()
+        {
+            Application.targetFrameRate = 120;
+        }
+        public void SetMaxFpsUnlimited()
+        {
+            Application.targetFrameRate = -1;
+        }
+        public void NextDrawMode()
+        {
+            _drawMode = _drawMode switch
+            {
+                DrawMode.MultiDrawIndexedIndirect       => DrawMode.ProceduralIndirectLoop,
+                DrawMode.ProceduralIndirectLoop          => DrawMode.RenderPrimitivesIndexedIndirect,
+                DrawMode.RenderPrimitivesIndexedIndirect => DrawMode.MultiDrawMeshIndirect,
+                DrawMode.MultiDrawMeshIndirect           => DrawMode.DrawMeshInstancedIndirect,
+                DrawMode.DrawMeshInstancedIndirect       => DrawMode.RenderMeshIndirect,
+                _                                        => DrawMode.MultiDrawIndexedIndirect,
+            };
         }
 
         private void OnBeginCameraRendering(ScriptableRenderContext context, Camera camera)
